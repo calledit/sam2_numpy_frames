@@ -168,6 +168,57 @@ class AsyncVideoFrameLoader:
     def __len__(self):
         return len(self.images)
 
+def load_video_frames_from_numpy_list(
+    frames,                # list of np.ndarray (H,W,3) or a single np.ndarray of shape (N,H,W,3)
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+    assume_bgr=True,       # OpenCV gives BGR; set False if your frames are already RGB
+):
+    """Load/resize/normalize frames from a numpy list/array, matching the MP4 path behavior."""
+    import cv2
+
+    # Normalize inputs to a list of HxWx3 uint8 arrays
+    if isinstance(frames, np.ndarray) and frames.ndim == 4:
+        frames_list = [frames[i] for i in range(frames.shape[0])]
+    else:
+        frames_list = list(frames)
+
+    if len(frames_list) == 0:
+        raise ValueError("No frames provided")
+
+    h0, w0 = frames_list[0].shape[:2]   # original (before resize)
+    img_mean_t = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std_t = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    # Resize to (image_size, image_size) like the MP4 path and convert to CHW torch
+    chw_frames = []
+    for f in frames_list:
+        if f.ndim != 3 or f.shape[2] != 3:
+            raise ValueError(f"Expected HxWx3 frames, got shape {f.shape}")
+        # convert color to RGB if needed (decord returns RGB)
+        if assume_bgr:
+            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        # resize to square, matching decord(VideoReader(..., width=image_size, height=image_size))
+        if (f.shape[1], f.shape[0]) != (image_size, image_size):
+            f = cv2.resize(f, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        # HWC uint8 -> CHW float32 in [0,1]
+        t = torch.from_numpy(f).permute(2, 0, 1).contiguous().float() / 255.0
+        chw_frames.append(t)
+
+    images = torch.stack(chw_frames, dim=0)  # (N,3,H,W)
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean_t = img_mean_t.to(compute_device)
+        img_std_t = img_std_t.to(compute_device)
+
+    # normalize per-channel like the MP4 path
+    images -= img_mean_t
+    images /= img_std_t
+
+    return images, h0, w0
 
 def load_video_frames(
     video_path,
@@ -179,12 +230,22 @@ def load_video_frames(
     compute_device=torch.device("cuda"),
 ):
     """
-    Load the video frames from video_path. The frames are resized to image_size as in
-    the model and are loaded to GPU if offload_video_to_cpu=False. This is used by the demo.
+    Load the video frames from `video_path`, which can be:
+      - MP4 file path
+      - folder of JPEGs
+      - list/tuple of np.ndarray frames (HxWx3)
+      - np.ndarray of shape (N,H,W,3)
+    Frames are resized to image_size and normalized; optionally moved to GPU.
     """
     is_bytes = isinstance(video_path, bytes)
     is_str = isinstance(video_path, str)
     is_mp4_path = is_str and os.path.splitext(video_path)[-1] in [".mp4", ".MP4"]
+
+    # NEW: numpy list/array path
+    is_np_seq = (
+        isinstance(video_path, (list, tuple)) and len(video_path) > 0 and isinstance(video_path[0], np.ndarray)
+    ) or (isinstance(video_path, np.ndarray) and video_path.ndim == 4)
+
     if is_bytes or is_mp4_path:
         return load_video_frames_from_video_file(
             video_path=video_path,
@@ -204,9 +265,19 @@ def load_video_frames(
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+    elif is_np_seq:
+        return load_video_frames_from_numpy_list(
+            frames=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+            compute_device=compute_device,
+            assume_bgr=True,  # set False if your frames are already RGB
+        )
     else:
         raise NotImplementedError(
-            "Only MP4 video and JPEG folder are supported at this moment"
+            "Only MP4 video, JPEG folder, or list/array of HxWx3 numpy frames are supported."
         )
 
 
